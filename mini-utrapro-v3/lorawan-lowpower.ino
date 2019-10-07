@@ -6,7 +6,6 @@
 #include <SerialFlash.h>
 
 // for the BME280
-#include <Wire.h>
 #include <Adafruit_Sensor.h>
 #include <Adafruit_BME280.h>
 
@@ -15,6 +14,7 @@
 
 // Create the Lightsensor object
 BH1750 lightSensor(0x23);
+
 // Create bme280 I2C sensor object
 Adafruit_BME280 bme;
 
@@ -46,21 +46,20 @@ void os_getDevEui (u1_t* buf) {
 }
 
 // This key should be in big endian format (or, since it is not really a
-// number but a block of memory, endianness does not really apply). In
-// practice, a key taken from ttnctl can be copied as-is.
+// number but a block of memory, endianness does not really apply). 
 static const u1_t PROGMEM APPKEY[16] = { 0x10, 0x09, 0x10, 0x50, 0x00, 0x5d, 0x30, 0x06, 0x10, 0x09, 0x10, 0x50, 0x00, 0x5d, 0x30, 0x06 };
 void os_getDevKey (u1_t* buf) {
   memcpy_P(buf, APPKEY, 16);
 }
 
 // sensor data:
-// [temp]         1 byte  - Farenheit
+// [temp]         1 byte  - Farenheit/Celcius
 // [humidity]     1 byte  - percent
 // [pressure]     2 bytes - hPa
 // [moisture]     1 byte  - percent
-// [ground temp]  1 byte  - Farenheit
+// [ground temp]  1 byte  - Farenheit/Celcius
 // [light]        2 bytes - Lux (max 65535)
-// [battery]      2 bytes  - Volt ( e.g 355 -> 3.55v)
+// [battery]      2 bytes - Volt ( e.g 355 -> 3.55v)
 
 const uint8_t PACKET_SIZE = 10;
 uint8_t fullPayload[PACKET_SIZE];
