@@ -1,11 +1,11 @@
 #include <lmic.h>
 #include <hal/hal.h>
 #include <SPI.h>
-#include <Wire.h>
 #include <RTCZero.h>
 #include <SerialFlash.h>
 
 // for the BME280
+#include <Wire.h>
 #include <Adafruit_Sensor.h>
 #include <Adafruit_BME280.h>
 
@@ -14,7 +14,6 @@
 
 // Create the Lightsensor object
 BH1750 lightSensor(0x23);
-
 // Create bme280 I2C sensor object
 Adafruit_BME280 bme;
 
@@ -22,7 +21,6 @@ Adafruit_BME280 bme;
 int MOISTURE_SENSOR_PIN = 13;
 int MIN_ADC = 1720;
 int MAX_ADC = 3800;
-
 
 #define EUI64_CHIP_ADDRESS 0x50
 #define EUI64_MAC_ADDRESS 0xF8
@@ -46,25 +44,51 @@ void os_getDevEui (u1_t* buf) {
 }
 
 // This key should be in big endian format (or, since it is not really a
-// number but a block of memory, endianness does not really apply). 
+// number but a block of memory, endianness does not really apply). In
+// practice, a key taken from ttnctl can be copied as-is.
 static const u1_t PROGMEM APPKEY[16] = { 0x10, 0x09, 0x10, 0x50, 0x00, 0x5d, 0x30, 0x06, 0x10, 0x09, 0x10, 0x50, 0x00, 0x5d, 0x30, 0x06 };
 void os_getDevKey (u1_t* buf) {
   memcpy_P(buf, APPKEY, 16);
 }
 
-// sensor data:
-// [temp]         1 byte  - Farenheit/Celcius
+// sensor data: variable length
+// [header]
+// [battery]      2 bytes  - Volt ( e.g 355 -> 3.55v)
+// [temp]         1 byte  - Farenheit
 // [humidity]     1 byte  - percent
 // [pressure]     2 bytes - hPa
 // [moisture]     1 byte  - percent
-// [ground temp]  1 byte  - Farenheit/Celcius
+// [ground temp]  1 byte  - Farenheit
 // [light]        2 bytes - Lux (max 65535)
-// [battery]      2 bytes - Volt ( e.g 355 -> 3.55v)
 
-const uint8_t PACKET_SIZE = 10;
-uint8_t fullPayload[PACKET_SIZE];
+#define BAT       0x01
+#define ATEMP     0x02
+#define HUMID     0x04
+#define PRESS     0x08
+#define MOIST     0x10
+#define GTEMP     0x20
+#define LIGHT     0x40
 
-const bool isFake = false;
+
+//const uint8_t PACKET_SIZE = 10;
+//uint8_t fullPayload[PACKET_SIZE];
+uint8_t *fullPayload;
+uint8_t data_length = 1; // counting the header
+
+typedef struct sensor_data {
+  uint16_t light;
+  uint16_t pressure;
+  uint16_t battery;
+
+  int8_t air_temp;
+  int8_t humidity;
+  int8_t moisture;
+  int8_t ground_temp;
+} sensor_data;
+
+
+sensor_data sensorData;
+
 
 // save the session info in RTC memory during deep sleep
 u4_t netid = 0;
@@ -73,7 +97,10 @@ u1_t nwkKey[16];
 u1_t artKey[16];
 u4_t sequence_up = 0;
 u4_t sequence_dn = 0;
+
 bool isShutdown = false;
+bool deep_sleep_enabled = true;
+bool send_once = false;
 
 static osjob_t sendjob;
 
@@ -147,6 +174,34 @@ void shutDownRadio() {
   pinMode(6, INPUT_PULLUP);
 }
 
+void goToSleepNow() {
+  shutDownRadio();
+
+  SerialUSB.println(F("Going to standby mode"));
+  // Ensure all debugging messages are sent before sleep
+  SerialUSB.flush();
+  // Set sleep period of TX_INTERVAL using single shot alarm
+  rtc.setAlarmEpoch(rtc.getEpoch() + TX_INTERVAL);
+  rtc.enableAlarm(rtc.MATCH_YYMMDDHHMMSS);
+  rtc.attachInterrupt(alarmMatch);
+  // USB port consumes extra current
+  USBDevice.detach();
+  // Enter sleep mode
+  rtc.standbyMode();
+  // Waking up and resuming code execution
+  // Reinitialize USB for debugging
+  USBDevice.init();
+  USBDevice.attach();
+
+  initLoraRadio();
+
+  // Schedule next transmission to be immediately after this
+  // because we send data as part of the sleep/wake cycle
+  // if the device was always awake the callback interval would be TX_INTERVAL
+  os_setTimedCallback(&sendjob, os_getTime() + sec2osticks(1), do_send);
+  
+}
+
 void onEvent (ev_t ev)
 {
   switch (ev) {
@@ -183,38 +238,24 @@ void onEvent (ev_t ev)
       break;
     case EV_TXCOMPLETE:
       digitalWrite(LED_BUILTIN, LOW);
-      shutDownRadio();
 
-      SerialUSB.println(F("TXCOMPLETE ( + waiting for RX windows)"));
-      if (LMIC.txrxFlags & TXRX_ACK) {
-        SerialUSB.println(F("Received ack"));
+      if (!deep_sleep_enabled) {      
+        SerialUSB.println(F("TXCOMPLETE ( + waiting for RX windows)"));
+        if (LMIC.txrxFlags & TXRX_ACK) {
+            SerialUSB.println(F("Received ack"));
+        }
+        if (LMIC.dataLen) {
+            Serial.print(F("Received "));
+            Serial.print(LMIC.dataLen);
+            Serial.println(F(" bytes of payload"));
+        }
       }
-
-      SerialUSB.println(F("Going to standby mode"));
-      // Ensure all debugging messages are sent before sleep
-      SerialUSB.flush();
-      // Set sleep period of TX_INTERVAL using single shot alarm
-      rtc.setAlarmEpoch(rtc.getEpoch() + TX_INTERVAL);
-      rtc.enableAlarm(rtc.MATCH_YYMMDDHHMMSS);
-      rtc.attachInterrupt(alarmMatch);
-
-      // USB port consumes extra current
-      USBDevice.detach();
-
-      // Enter sleep mode
-      rtc.standbyMode();
-
-      // Waking up and resuming code execution
-      // Reinitialize USB for debugging
-      USBDevice.init();
-      USBDevice.attach();
-
-      initLoraRadio();
-
-      // Schedule next transmission to be immediately after this
-      // because we send data as part of the sleep/wake cycle
-      // if the device was always awake the callback interval would be TX_INTERVAL
-      os_setTimedCallback(&sendjob, os_getTime() + sec2osticks(1), do_send);
+      if (deep_sleep_enabled) {
+        goToSleepNow();
+      } else {
+        // Schedule next transmission
+        os_setTimedCallback(&sendjob, os_getTime() + sec2osticks(TX_INTERVAL), do_send);
+      }
       break;
     case EV_LOST_TSYNC:
       SerialUSB.println(F("LOST_TSYNC"));
@@ -307,17 +348,29 @@ uint16_t getBatteryVoltage() {
 
 void do_send(osjob_t* j)
 {
-  digitalWrite(LED_BUILTIN, HIGH);
   // Check if there is not a current TX/RX job running
   if (LMIC.opmode & OP_TXRXPEND) {
     SerialUSB.println(F("OP_TXRXPEND, not sending"));
   }
   else {
     SerialUSB.println(F("Getting sensor data and sending..."));
-    get_sensor_data(isFake);
-    // Prepare upstream data transmission at the next possible time.
-    LMIC_setTxData2(1, fullPayload, sizeof(fullPayload), 0);
-    SerialUSB.println("[do_send] Packet queued");
+    if (get_sensor_data()) {
+      digitalWrite(LED_BUILTIN, HIGH);
+      // Prepare upstream data transmission at the next possible time.
+      int err = LMIC_setTxData2(1, fullPayload, data_length, 0);
+      if (err != 0) {
+        SerialUSB.print("LMIC_setTxData2 returned an error: ");SerialUSB.println(err);
+      }
+      SerialUSB.println("[do_send] Packet queued");
+    } else {
+      if (deep_sleep_enabled) {
+        // going right back to sleep. This will also schedule the next send job (1 second after waking up);
+        goToSleepNow(); 
+      } else {
+        // Schedule next transmission
+        os_setTimedCallback(&sendjob, os_getTime() + sec2osticks(TX_INTERVAL), do_send);
+      }
+    }
   }
 }
 
@@ -415,7 +468,7 @@ void setup()
   while (!SerialUSB && millis() < 10000);
   SerialUSB.begin(115200);
   SerialUSB.println(F("Starting"));
-  
+
   setDevEui(&DEVEUI[EUI64_MAC_LENGTH - 1]);
   printDevEUI();
 
@@ -430,11 +483,12 @@ void setup()
   rtc.setEpoch(0);
 
   SerialUSB.println("HUB-001 STARTING...");
-  if ( !isFake) {
-    SerialUSB.println("BME280: Initializing...");
-    init_bme280();
-    init_bh1750();
-  }
+  SerialUSB.println("BME280: Initializing...");
+  init_bme280();
+  init_bh1750();
+
+
+  memset(&sensorData, 0, sizeof(sensor_data));
 
   initLoraRadio();
 
@@ -443,80 +497,143 @@ void setup()
   do_send(&sendjob);
 }
 
-void get_sensor_data(bool fake) {
+bool get_sensor_data() {
   uint16_t l, p, b;
-  int8_t t, h, m, g = 0;
+  int8_t t, h, m, g = 20;
 
-  if (fake) {
-    t = -15;
-    p = 1012;
-    h = 45;
-    m = 75;
-    g = -17;
-    l = 55245;
-    b = getBatteryVoltage();
-    fullPayload[8] = lowByte(b);
-    fullPayload[9] = highByte(b);
-
-  } else {
-    // ambient air temp
-    t = bme.readTemperature();
-    // barometric pressure
-    p = bme.readPressure() / 100.0F;
-    // air humidity
-    h = bme.readHumidity(); // Percentage
-    // moisture
-    int val = analogRead(MOISTURE_SENSOR_PIN);
-    if (val <= MIN_ADC) {
-      val = MIN_ADC;
-    } else if ( val >= MAX_ADC) {
-      val = MAX_ADC;
-    }
-    m  = ((MAX_ADC - val) / (float)(MAX_ADC - MIN_ADC) ) * 100.0;
-
-    // light intensity
-    l = lightSensor.readLightLevel();
-    
-    // read battery voltage
-    b = getBatteryVoltage();
+  if ( fullPayload != NULL ) {
+    data_length = 1;
+    free(fullPayload);
   }
 
+  // ambient air temp
+  t = bme.readTemperature();
+  // barometric pressure
+  p = bme.readPressure() / 100.0F;
+  // air humidity
+  h = bme.readHumidity(); // Percentage
+  // moisture
+  int val = analogRead(MOISTURE_SENSOR_PIN);
+  if (val <= MIN_ADC) {
+    val = MIN_ADC;
+  } else if ( val >= MAX_ADC) {
+    val = MAX_ADC;
+  }
+  m  = ((MAX_ADC - val) / (float)(MAX_ADC - MIN_ADC) ) * 100.0;
+
+  // light intensity
+  l = lightSensor.readLightLevel();
+
+  // read battery voltage
+  b = getBatteryVoltage();
+
   SerialUSB.println("============================");
-  // Convert temperature to Fahrenheit
-  SerialUSB.print("T = "); SerialUSB.print(t); SerialUSB.println(" *C");
-  SerialUSB.print("H = "); SerialUSB.print(h); SerialUSB.println(" %");
 
-  SerialUSB.print("P = "); SerialUSB.print(p); SerialUSB.println(" hPa");
-  SerialUSB.print("M = "); SerialUSB.print(m); SerialUSB.println(" %");
-  SerialUSB.print("G = "); SerialUSB.print(g); SerialUSB.println(" *C");
+  uint8_t header = 0x00;
 
-  SerialUSB.print("L = "); SerialUSB.print(l); SerialUSB.println(" lux");
+  if (b != sensorData.battery) {
+    header += BAT;
+    data_length += 2;
+    sensorData.battery = b;
+    SerialUSB.print("B = "); SerialUSB.print((float)b / 100.00); SerialUSB.println("v");
+  }
 
-  SerialUSB.print("B = "); SerialUSB.print(b / 100); SerialUSB.println("v");
+  if (t != sensorData.air_temp) {
+    data_length += 1;
+    header += ATEMP;
+    sensorData.air_temp = t;
+    SerialUSB.print("T = "); SerialUSB.print(t); SerialUSB.println(" *C");
+  }
 
-  SerialUSB.print("DewPoint = "); SerialUSB.print(dewPoint(t, h, true)); SerialUSB.println(" *C");
+  if (h != sensorData.humidity) {
+    data_length += 1;
+    header += HUMID;
+    sensorData.humidity = h;
+    SerialUSB.print("H = "); SerialUSB.print(h); SerialUSB.println(" %");
+  }
 
-  // [temp]         1 byte  - Farenheit
+  if (p != sensorData.pressure) {
+    data_length += 2;
+    header += PRESS;
+    sensorData.pressure = p;
+    SerialUSB.print("P = "); SerialUSB.print(p); SerialUSB.println(" hPa");
+  }
+
+  if (m != sensorData.moisture) {
+    data_length += 1;
+    header += MOIST;
+    sensorData.moisture = m;
+    SerialUSB.print("M = "); SerialUSB.print(m); SerialUSB.println(" %");
+  }
+  if (g != sensorData.ground_temp) {
+    data_length += 1;
+    header += GTEMP;
+    sensorData.ground_temp = g;
+    SerialUSB.print("G = "); SerialUSB.print(g); SerialUSB.println(" *C");
+  }
+
+  if (l != sensorData.light) {
+    data_length += 2;
+    header += LIGHT;
+    sensorData.light = l;
+    SerialUSB.print("L = "); SerialUSB.print(l); SerialUSB.println(" lux");
+  }
+
+  // don't send data if nothing's changed
+  if (header == 0) {
+    return false;
+  }
+  
+  // [header]       1 byte
+  // [battery]      2 bytes - Volt
+  // [temp]         1 byte  - Celicius
   // [humidity]     1 byte  - Percent
   // [pressure]     2 bytes - HPa
   // [moisture]     1 byte  - Percent
-  // [ground temp]  1 byte  - Farenheit
+  // [ground temp]  1 byte  - Celcius
   // [light]        2 bytes - Lux
-  // [battery]      2 bytes - Volt
 
+  fullPayload = (uint8_t *) malloc(sizeof(uint8_t) * data_length);
 
-  fullPayload[0] = t;
-  fullPayload[1] = h;
-  fullPayload[2] = lowByte(p);
-  fullPayload[3] = highByte(p);
-  fullPayload[4] = m;
-  fullPayload[5] = g; // fake ground temperature
-  fullPayload[6] = lowByte(l);
-  fullPayload[7] = highByte(l);
-  fullPayload[8] = lowByte(b);
-  fullPayload[9] = highByte(b);
+  int pos = 0;
+  fullPayload[pos] = header;
 
+  if ((header & BAT) == BAT) {
+    fullPayload[++pos] = lowByte(sensorData.battery);
+    fullPayload[++pos] = highByte(sensorData.battery);
+  }
+  if ((header & ATEMP) == ATEMP) {
+    fullPayload[++pos] = sensorData.air_temp;
+  }
+  if ((header & HUMID) == HUMID) {
+    fullPayload[++pos] = sensorData.humidity;
+  }
+  if ((header & PRESS) == PRESS) {
+    fullPayload[++pos] = lowByte(sensorData.pressure);
+    fullPayload[++pos] = highByte(sensorData.pressure);
+  }
+  if ((header & MOIST) == MOIST) {
+    fullPayload[++pos] = sensorData.moisture;
+  }
+  if ((header & GTEMP) == GTEMP) {
+    fullPayload[++pos] = sensorData.ground_temp;
+  }
+  if ((header & LIGHT) == LIGHT) {
+    fullPayload[++pos] = lowByte(sensorData.light);
+    fullPayload[++pos] = highByte(sensorData.light);
+  }
+
+  SerialUSB.print(" length:"); SerialUSB.println(data_length);
+  for (int i = 0; i < data_length; ++i) {
+    SerialUSB.print("0x");
+    SerialUSB.print(fullPayload[i], HEX);
+    SerialUSB.print(" ");
+  }
+
+  SerialUSB.println("");
   SerialUSB.println("============================");
+
+  return true;
 }
 
 void loop() {
