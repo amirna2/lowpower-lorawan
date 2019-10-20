@@ -89,7 +89,6 @@ typedef struct sensor_data {
 
 sensor_data sensorData;
 
-
 // save the session info in RTC memory during deep sleep
 u4_t netid = 0;
 devaddr_t devaddr = 0;
@@ -101,6 +100,7 @@ u4_t sequence_dn = 0;
 bool isShutdown = false;
 bool deep_sleep_enabled = true;
 bool send_once = false;
+bool always_send = false;
 
 static osjob_t sendjob;
 
@@ -136,6 +136,7 @@ void initLoraRadio() {
   //LMIC_setDrTxpow(DR_SF7,14);
   if (isShutdown) {
     isShutdown = false;
+    
     SerialUSB.println("Was shutdown..set session");
     printSessionInfo();
     LMIC_setSession(netid, devaddr, nwkKey, artKey);
@@ -153,11 +154,11 @@ void initLoraRadio() {
 */
 void shutDownRadio() {
   Serial.println(F("Shutting LMIC Down"));
+  // save sequence numbers so we can restore/resume when we wake up
   sequence_up = LMIC.seqnoUp;
   sequence_dn = LMIC.seqnoDn;
   LMIC_shutdown();
-  isShutdown = true;
-
+  
   digitalWrite(24, LOW); // SCK
   pinMode(24, OUTPUT);
   digitalWrite(23, LOW); // MOSI
@@ -172,6 +173,8 @@ void shutDownRadio() {
   // DIO Inputs
   pinMode(2, INPUT_PULLUP);
   pinMode(6, INPUT_PULLUP);
+
+  isShutdown = true;
 }
 
 void goToSleepNow() {
@@ -184,10 +187,13 @@ void goToSleepNow() {
   rtc.setAlarmEpoch(rtc.getEpoch() + TX_INTERVAL);
   rtc.enableAlarm(rtc.MATCH_YYMMDDHHMMSS);
   rtc.attachInterrupt(alarmMatch);
+  
   // USB port consumes extra current
   USBDevice.detach();
+  
   // Enter sleep mode
   rtc.standbyMode();
+  
   // Waking up and resuming code execution
   // Reinitialize USB for debugging
   USBDevice.init();
@@ -198,8 +204,7 @@ void goToSleepNow() {
   // Schedule next transmission to be immediately after this
   // because we send data as part of the sleep/wake cycle
   // if the device was always awake the callback interval would be TX_INTERVAL
-  os_setTimedCallback(&sendjob, os_getTime() + sec2osticks(1), do_send);
-  
+  os_setTimedCallback(&sendjob, os_getTime() + sec2osticks(1), do_send);  
 }
 
 void onEvent (ev_t ev)
@@ -319,6 +324,7 @@ void printSessionInfo() {
   SerialUSB.println("");
 
 }
+
 uint16_t getBatteryVoltage() {
   unsigned char counter;
   float batteryVoltage;
@@ -354,6 +360,9 @@ void do_send(osjob_t* j)
   }
   else {
     SerialUSB.println(F("Getting sensor data and sending..."));
+
+    // check if we have any sensor data updates and send them
+    // otherwise we go right back to sleep
     if (get_sensor_data()) {
       digitalWrite(LED_BUILTIN, HIGH);
       // Prepare upstream data transmission at the next possible time.
@@ -461,7 +470,7 @@ void setDevEui(unsigned char* buf) {
 void setup()
 {
 
-  //configureUnusedPins();
+  configureUnusedPins();
 
   pinMode(LED_BUILTIN, OUTPUT);
 
@@ -486,8 +495,7 @@ void setup()
   SerialUSB.println("BME280: Initializing...");
   init_bme280();
   init_bh1750();
-
-
+  
   memset(&sensorData, 0, sizeof(sensor_data));
 
   initLoraRadio();
@@ -531,48 +539,48 @@ bool get_sensor_data() {
 
   uint8_t header = 0x00;
 
-  if (b != sensorData.battery) {
+  if (b != sensorData.battery || always_send) {
     header += BAT;
     data_length += 2;
     sensorData.battery = b;
     SerialUSB.print("B = "); SerialUSB.print((float)b / 100.00); SerialUSB.println("v");
   }
 
-  if (t != sensorData.air_temp) {
+  if (t != sensorData.air_temp || always_send) {
     data_length += 1;
     header += ATEMP;
     sensorData.air_temp = t;
     SerialUSB.print("T = "); SerialUSB.print(t); SerialUSB.println(" *C");
   }
 
-  if (h != sensorData.humidity) {
+  if (h != sensorData.humidity || always_send) {
     data_length += 1;
     header += HUMID;
     sensorData.humidity = h;
     SerialUSB.print("H = "); SerialUSB.print(h); SerialUSB.println(" %");
   }
 
-  if (p != sensorData.pressure) {
+  if (p != sensorData.pressure || always_send) {
     data_length += 2;
     header += PRESS;
     sensorData.pressure = p;
     SerialUSB.print("P = "); SerialUSB.print(p); SerialUSB.println(" hPa");
   }
 
-  if (m != sensorData.moisture) {
+  if (m != sensorData.moisture || always_send) {
     data_length += 1;
     header += MOIST;
     sensorData.moisture = m;
     SerialUSB.print("M = "); SerialUSB.print(m); SerialUSB.println(" %");
   }
-  if (g != sensorData.ground_temp) {
+  if (g != sensorData.ground_temp || always_send) {
     data_length += 1;
     header += GTEMP;
     sensorData.ground_temp = g;
     SerialUSB.print("G = "); SerialUSB.print(g); SerialUSB.println(" *C");
   }
 
-  if (l != sensorData.light) {
+  if (l != sensorData.light || always_send) {
     data_length += 2;
     header += LIGHT;
     sensorData.light = l;
