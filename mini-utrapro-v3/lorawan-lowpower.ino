@@ -12,15 +12,25 @@
 //for BH1750
 #include <BH1750.h>
 
+
+bool isShutdown = false;
+bool deep_sleep_enabled = true;
+bool send_once = false;
+bool always_send = true;
+bool use_analog_light_sensor = false;
+
+
 // Create the Lightsensor object
 BH1750 lightSensor(0x23);
 // Create bme280 I2C sensor object
 Adafruit_BME280 bme;
 
 /* for capacitive moisture sensor */
-int MOISTURE_SENSOR_PIN = 13;
+int MOISTURE_SENSOR_PIN = A4; //A4
 int MIN_ADC = 1720;
 int MAX_ADC = 3800;
+
+int LIGHT_SENSOR_PIN = A1;
 
 #define EUI64_CHIP_ADDRESS 0x50
 #define EUI64_MAC_ADDRESS 0xF8
@@ -97,10 +107,6 @@ u1_t artKey[16];
 u4_t sequence_up = 0;
 u4_t sequence_dn = 0;
 
-bool isShutdown = false;
-bool deep_sleep_enabled = true;
-bool send_once = false;
-bool always_send = false;
 
 static osjob_t sendjob;
 
@@ -325,6 +331,16 @@ void printSessionInfo() {
 
 }
 
+uint16_t getIlluminance() {
+
+  int adcReading = analogRead(LIGHT_SENSOR_PIN);
+  float volts = adcReading * (4.3 / 1023.0);
+  float amps = volts / 10000.0; // across 10,000 Ohms
+  float microamps = amps * 1000000;
+  uint16_t lux = microamps * 2.0;
+  return lux;
+}
+
 uint16_t getBatteryVoltage() {
   unsigned char counter;
   float batteryVoltage;
@@ -407,12 +423,14 @@ void configureUnusedPins() {
   }
 }
 
-float RawToLux(int raw) {
+float RawToLuxLog(int raw) {
   float rawRange = 4096.0; // 3.3v
   float logRange = 5.0; // 3.3v = 10^5 lux
   float logLux = raw * logRange / rawRange;
   return pow(10, logLux);
 }
+
+
 
 float dewPoint( float temp, float hum, bool celcius)
 {
@@ -494,7 +512,10 @@ void setup()
   SerialUSB.println("HUB-001 STARTING...");
   SerialUSB.println("BME280: Initializing...");
   init_bme280();
-  init_bh1750();
+  
+  if (!use_analog_light_sensor) {
+    init_bh1750();
+  }
   
   memset(&sensorData, 0, sizeof(sensor_data));
 
@@ -530,8 +551,11 @@ bool get_sensor_data() {
   m  = ((MAX_ADC - val) / (float)(MAX_ADC - MIN_ADC) ) * 100.0;
 
   // light intensity
-  l = lightSensor.readLightLevel();
-
+  if (use_analog_light_sensor) {
+    l = getIlluminance();
+  } else {
+    l = lightSensor.readLightLevel();
+  }
   // read battery voltage
   b = getBatteryVoltage();
 
